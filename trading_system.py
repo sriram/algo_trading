@@ -48,6 +48,11 @@ def reset_app():
     st.session_state["search_results"] = []
     st.session_state["selected_symbol"] = None
 
+
+ # Function to calculate CAGR
+def calculate_cagr(start_value, end_value, years):
+    return (end_value / start_value) ** (1 / years) - 1
+
 # Step 1: Search Box
 st.header("Step 1: Search for a Stock/ETF")
 search_query = st.text_input(
@@ -189,9 +194,12 @@ if st.session_state.get("selected_symbol"):
         ):
             most_recent_signal = f"Buy on {most_recent_buy_date.strftime('%Y-%m-%d')}"
             signal_color = "green"
-        else:
+        elif most_recent_sell_date != "No Sell Signal":
             most_recent_signal = f"Sell on {most_recent_sell_date.strftime('%Y-%m-%d')}"
             signal_color = "red"
+        else:
+            most_recent_signal = f"No signals yet"
+            signal_color = "gray"
 
         # Add custom CSS for dark background and flashing effect
         st.markdown(
@@ -244,11 +252,8 @@ if st.session_state.get("selected_symbol"):
         # Proper calculation for total wealth
         if portfolio.trades.count() > 0:
             first_trade = portfolio.trades.records.iloc[0]
-            # st.write("First trade details:", first_trade)
-            # st.write("First trade details:", portfolio.trades.records.head())
         else:
             st.write("No trades were executed during the backtest period.")
-
 
 
         # Create tabs for main content and debugging
@@ -299,20 +304,36 @@ if st.session_state.get("selected_symbol"):
             st.plotly_chart(fig, use_container_width=True)
 
             # ========== Performance Dashboard ==========
-            st.header("Performance Metrics")
+            st.header("Strategy Returns")
 
-            col1, col2, col3 = st.columns(3)
+            # Example data (replace with actual backtesting results)
+            # Calculate start value, end value, and CAGR
+            start_value = portfolio.init_cash  # Initial cash used for backtesting
+            end_value = portfolio.value().iloc[-1]  # Final portfolio value at the end of backtesting
+            years = (end_date - start_date).days / 365.0
+
+            # Calculate CAGR
+            strat_cagr = calculate_cagr(start_value, end_value, years)
+
+            # Display Strategy Returns Section
+            col1, col2, col3, col4 = st.columns(4)
+
             # If total_return() returns a Series or DataFrame due to grouping/multiple assets:
             if isinstance(portfolio.total_return(), pd.Series) or isinstance(portfolio.total_return(), pd.DataFrame):
                 total_return = portfolio.total_return().mean()  # Aggregate if needed
             else:
                 total_return = portfolio.total_return()
 
-            col1.metric("Total Return", f"{total_return * 100:.2f}%")
+            col1.metric("Initial Value", f"${start_value:,.2f}")
+            col2.metric("Final Value", f"${end_value:,.2f}")
+            col3.metric("Return Percentage", f"{total_return * 100:.2f}%")
+            col4.metric("CAGR", f"{strat_cagr * 100:.2f}%")
+            # col2.metric("Annualized Return", f"{portfolio.annualized_return()*100:.2f}%")
 
-            #col1.metric("Total Return", f"${portfolio.total_return():.2f}")
-            col2.metric("Annualized Return", f"{portfolio.annualized_return()*100:.2f}%")
-            col3.metric("Max Drawdown", f"{portfolio.max_drawdown()*100:.2f}%")
+            # col1, col2, col3 = st.columns(3)
+            # col1.metric("Total Return", f"{total_return * 100:.2f}%")
+            # col2.metric("Annualized Return", f"{portfolio.annualized_return()*100:.2f}%")
+            # col3.metric("Max Drawdown", f"{portfolio.max_drawdown()*100:.2f}%")
 
 
             # ========== Trade Performance Summary ==========
@@ -346,19 +367,29 @@ if st.session_state.get("selected_symbol"):
                 col1.metric("Initial Investment", f"${initial_capital:,.2f}")
                 col2.metric("Final Value", f"${bh_final_value[symbol]:,.2f}")
                 col3.metric("Return Percentage", f"{bh_return_pct[symbol]:,.2f}%")
-                col4.metric("Annualized Return", f"{cagr[symbol]*100:,.2f}%")
+                col4.metric("CAGR", f"{cagr[symbol]*100:,.2f}%")
             else:
                 raise ValueError("No data available for the selected ticker and date range.")
 
-        # Add performance comparison summary
+            # Add performance comparison summary
             try:
-                performance_difference = portfolio.annualized_return() - cagr[symbol]
-                comparison_text = (
-                    f"**The trading strategy outperformed buy-and-hold by {(performance_difference)*100:.2f} percentage points.**"
-                    if performance_difference > 0 else
-                    f"**The trading strategy underperformed buy-and-hold by {abs(performance_difference)*100:.2f} percentage points.**"
-                )
-                st.markdown(comparison_text)
+                performance_difference = strat_cagr - cagr[symbol]
+                # Construct comparison text with dynamic color
+                if performance_difference > 0:
+                    comparison_text = (
+                        f"<p style='color:green; font-size:18px;'>"
+                        f"**The trading strategy outperformed buy-and-hold by {performance_difference * 100:.2f} percentage points.**"
+                        f"</p>"
+                    )
+                else:
+                    comparison_text = (
+                        f"<p style='color:red; font-size:18px;'>"
+                        f"**The trading strategy underperformed buy-and-hold by {abs(performance_difference) * 100:.2f} percentage points.**"
+                        f"</p>"
+                    )
+
+                # Display the styled text using Markdown
+                st.markdown(comparison_text, unsafe_allow_html=True)
             except Exception as e:
                 st.error(f"Could not compare performances: {str(e)}")
         
