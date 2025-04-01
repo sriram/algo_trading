@@ -7,7 +7,23 @@ from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import streamlit as st
 import requests
+import os
+from tensorflow.keras.models import load_model
+import numpy as np
+import ta
+from sklearn.preprocessing import StandardScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
 
+
+# Directory to save LSTM models
+MODEL_DIR = "saved_models"
+
+# Ensure the directory exists
+if not os.path.exists(MODEL_DIR):
+    os.makedirs(MODEL_DIR)
 
 # Configure page
 st.set_page_config(layout="wide", page_title="Trading System Pro", page_icon="📈")
@@ -133,30 +149,126 @@ if st.session_state.get("selected_symbol"):
             st.error("No data found for this symbol!")
             st.stop()
 
-        # ========== Signal Calculation ==========
-        def calculate_signals(data):
-            close_price = data['Close']
-            
-            # Calculate indicators with VectorBT (returns pandas Series)
-            fast_ma = vbt.MA.run(close_price, fast_period).ma
-            slow_ma = vbt.MA.run(close_price, slow_period).ma
-            
-            # Create aligned DataFrame using concat
-            aligned_data = pd.concat([close_price, fast_ma, slow_ma], axis=1).dropna()
-            aligned_data.columns = ['Close', 'fast_ma', 'slow_ma']
-            
-            # Generate signals using aligned data
-            entries = (aligned_data['fast_ma'] > aligned_data['slow_ma']) & \
-                    (aligned_data['fast_ma'].shift(1) <= aligned_data['slow_ma'].shift(1))
-            exits = (aligned_data['fast_ma'] < aligned_data['slow_ma']) & \
-                    (aligned_data['fast_ma'].shift(1) >= aligned_data['slow_ma'].shift(1))
-            
-            # Ensure we don't have conflicting signals
-            entries = entries & ~exits
-            
-            return entries, exits, aligned_data['fast_ma'], aligned_data['slow_ma'], aligned_data['Close']
+        
+        def calculate_signals(data, ticker):
+            # Feature Engineering Function
+            def create_features(df):
+                df = df.copy()
+                # Ensure proper pandas Series with index
+                high = pd.Series(df['High'].squeeze(), index=df.index)
+                low = pd.Series(df['Low'].squeeze(), index=df.index)
+                close = pd.Series(df['Close'].squeeze(), index=df.index)
+                
+                # Calculate ATR with explicit index handling
+                atr_indicator = ta.volatility.AverageTrueRange(
+                    high=high,
+                    low=low,
+                    close=close,
+                    window=14
+                )
+                df['atr'] = atr_indicator.average_true_range()
+                print(df[['High', 'Low', 'Close', 'atr']].head(10))
 
-        entries, exits, fast_ma, slow_ma, aligned_close = calculate_signals(data)
+                df['returns'] = np.log(df['Close'] / df['Close'].shift(1))
+                df['close_ratio'] = df['Close'] / df['Close'].rolling(50).mean()
+                rsi_indicator = ta.momentum.RSIIndicator(close=df['Close'].squeeze(), window=14)
+                df['RSI'] = rsi_indicator.rsi()
+                print(rsi_indicator.rsi().shape)  # Should now be (1318,)
+                print(df['RSI'].shape)  # Confirms 1D structure
+
+                df['MACD'] = ta.trend.MACD(close=df['Close'].squeeze()).macd_diff()
+                df['BB_Width'] = ta.volatility.BollingerBands(close=df['Close'].squeeze()).bollinger_wband()
+                df['obv'] = ta.volume.OnBalanceVolumeIndicator(df['Close'].squeeze(), df['Volume'].squeeze()).on_balance_volume()
+                for lag in [1, 3, 5, 8, 13]:
+                    df[f'ret_lag_{lag}'] = df['returns'].shift(lag)
+                df['target'] = np.where(
+                    df['returns'].shift(-3) > 0.015, 1,
+                    np.where(df['returns'].shift(-3) < -0.015, -1, 0)
+                )
+                return df.dropna()
+
+            # Feature Engineering
+            with st.spinner("Creating features..."):
+                df = create_features(data)
+
+            # Feature Scaling
+            scaler = StandardScaler()
+            features = df.drop('target', axis=1)
+            X = scaler.fit_transform(features)
+            X = X.reshape((X.shape[0], 1, X.shape[1]))  # Reshape for LSTM
+
+            # Train/Test Split (Time-based)
+            split = int(len(df) * 0.8)
+            X_train, X_test = X[:split], X[split:]
+            y_train, y_test = df['target'].iloc[:split], df['target'].iloc[split:]
+
+            # Model File Path
+            model_path = os.path.join(MODEL_DIR, f"{ticker}_model.keras")
+
+            # Check if model already exists
+            if os.path.exists(model_path):
+                with st.spinner(f"Loading saved model for {ticker}..."):
+                    model = load_model(model_path)
+                    st.success(f"Model loaded successfully!")
+            else:
+                # Model Architecture
+                def create_model():
+                    model = Sequential([
+                        LSTM(64, input_shape=(X_train.shape[1], X_train.shape[2]), return_sequences=True),
+                        Dropout(0.3),
+                        LSTM(32),
+                        Dropout(0.2),
+                        Dense(1, activation='tanh')  # Output between -1 and 1
+                    ])
+                    model.compile(optimizer=Adam(0.001), loss='mean_squared_error', metrics=['accuracy'])
+                    return model
+
+                with st.spinner(f"Training new model for {ticker}..."):
+                    model = create_model()
+                    early_stop = EarlyStopping(monitor='val_loss', patience=5)
+                    history = model.fit(
+                        X_train, y_train,
+                        epochs=50,
+                        batch_size=32,
+                        validation_split=0.2,
+                        callbacks=[early_stop],
+                        verbose=0
+                    )
+                    # Save the trained model
+                    model.save(model_path)
+                    st.success(f"Model saved successfully for {ticker}!")
+
+            # Generate Predictions
+            with st.spinner("Generating signals..."):
+                train_pred = model.predict(X_train).flatten()
+                test_pred = model.predict(X_test).flatten()
+                full_pred = np.concatenate([train_pred, test_pred])
+
+            # Signal Generation with Dynamic Thresholds
+            upper_threshold = st.session_state.get('upper_threshold', 0.65)
+            lower_threshold = st.session_state.get('lower_threshold', 0.35)
+
+            df['signal'] = np.where(full_pred > upper_threshold, 1,
+                                    np.where(full_pred < -lower_threshold, -1, 0))
+
+            # Align signals with original data
+            aligned_signals = df['signal'].reindex(data.index).ffill().dropna()
+            aligned_close = data['Close'].reindex(aligned_signals.index)
+
+            # Convert to boolean signals for VectorBT
+            entries = (aligned_signals == 1) & (aligned_signals.shift(1) != 1)
+            exits = (aligned_signals == -1) & (aligned_signals.shift(1) != -1)
+
+            return entries, exits, aligned_close
+
+        entries, exits, aligned_close = calculate_signals(data, symbol)
+
+        st.subheader("Debug: Signal Analysis")
+        st.write("Entries Signal (Buy):", entries)
+        st.write("Exits Signal (Sell):", exits)
+        st.write("Number of Buy Signals:", entries.sum())
+        st.write("Number of Sell Signals:", exits.sum())
+
 
         # ========== Backtesting Engine ==========
         try:
@@ -264,44 +376,14 @@ if st.session_state.get("selected_symbol"):
             # ========== Visualization ==========
             st.header(f"Trading Signals for {symbol}")
 
-            # Create interactive price chart
+            # Plot price chart with buy/sell signals
             fig = go.Figure()
+            fig.add_trace(go.Scatter(x=aligned_close.index, y=aligned_close, mode='lines', name='Close Price'))
+            fig.add_trace(go.Scatter(x=aligned_close[entries].index, y=aligned_close[entries], mode='markers', name='Buy Signal', marker=dict(color='green', size=10, symbol='triangle-up')))
+            fig.add_trace(go.Scatter(x=aligned_close[exits].index, y=aligned_close[exits], mode='markers', name='Sell Signal', marker=dict(color='red', size=10, symbol='triangle-down')))
+            fig.update_layout(title="Price Chart with Buy/Sell Signals", xaxis_title="Date", yaxis_title="Price")
+            st.plotly_chart(fig)
 
-            # Price and MAs
-            fig.add_trace(go.Scatter(x=aligned_close.index, y=aligned_close, name='Price', line=dict(color='#1f77b4')))
-            fig.add_trace(go.Scatter(x=fast_ma.index, y=fast_ma, name=f'MA {fast_period}', line=dict(color='orange', width=1.5)))
-            fig.add_trace(go.Scatter(x=slow_ma.index, y=slow_ma, name=f'MA {slow_period}', line=dict(color='purple', width=1.5)))
-
-            # Buy signals
-            buy_dates = entries[entries].index
-            buy_prices = aligned_close.loc[buy_dates]
-            fig.add_trace(go.Scatter(
-                x=buy_dates,
-                y=buy_prices,
-                mode='markers',
-                name='Buy',
-                marker=dict(color='green', size=10, symbol='triangle-up')
-            ))
-
-            # Sell signals
-            sell_dates = exits[exits].index
-            sell_prices = aligned_close.loc[sell_dates]
-            fig.add_trace(go.Scatter(
-                x=sell_dates,
-                y=sell_prices,
-                mode='markers',
-                name='Sell',
-                marker=dict(color='red', size=10, symbol='triangle-down')
-            ))
-
-            fig.update_layout(
-                title=f'{symbol} Price with Trading Signals',
-                xaxis_title='Date',
-                yaxis_title='Price ($)',
-                hovermode='x unified',
-                height=600
-            )
-            st.plotly_chart(fig, use_container_width=True)
 
             # ========== Performance Dashboard ==========
             st.header("Strategy Returns")
