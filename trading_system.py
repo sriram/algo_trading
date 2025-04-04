@@ -13,9 +13,9 @@ import numpy as np
 import ta
 from sklearn.preprocessing import StandardScaler
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.layers import Conv1D, LSTM, Dense, Dropout  # Added Conv1D
 
 
 # Directory to save LSTM models
@@ -149,117 +149,140 @@ if st.session_state.get("selected_symbol"):
             st.error("No data found for this symbol!")
             st.stop()
 
-        
-        def calculate_signals(data, ticker):
+        def calculate_signals(symbol_data, ticker):
             # Feature Engineering Function
+            # Existing features (ensure total features = 17)
+            # df['atr'] = ...          # 1
+            # df['volatility'] = ...    # 2
+            # df['returns'] = ...       # 3
+            # df['close_ratio'] = ...   # 4
+            # df['high_vol'] = ...      # 5
+            # df['sma_20'] = ...        # 6
+            # df['sma_50'] = ...        # 7
+            # df['RSI'] = ...           # 8
+            # df['MACD'] = ...          # 9
+            # df['BB_Width'] = ...      # 10
+            # df['obv'] = ...           # 11
+            # for lag in [1,3,5,8,13]:  # 5 lagged returns
+            #     df[f'ret_lag_{lag}'] = ...  
+            # # Total = 11 + 5 + 1(target) = 17 features
+            # return df.dropna()
             def create_features(df):
                 df = df.copy()
-                # Ensure proper pandas Series with index
                 high = pd.Series(df['High'].squeeze(), index=df.index)
                 low = pd.Series(df['Low'].squeeze(), index=df.index)
                 close = pd.Series(df['Close'].squeeze(), index=df.index)
-                
-                # Calculate ATR with explicit index handling
-                atr_indicator = ta.volatility.AverageTrueRange(
-                    high=high,
-                    low=low,
-                    close=close,
-                    window=14
-                )
+
+                # Calculate core features (9 total features)
+                atr_indicator = ta.volatility.AverageTrueRange(high=high, low=low, close=close, window=14)
                 df['atr'] = atr_indicator.average_true_range()
-                print(df[['High', 'Low', 'Close', 'atr']].head(10))
-
+                df['volatility'] = df['Close'].rolling(20).std()
                 df['returns'] = np.log(df['Close'] / df['Close'].shift(1))
-                df['close_ratio'] = df['Close'] / df['Close'].rolling(50).mean()
-                rsi_indicator = ta.momentum.RSIIndicator(close=df['Close'].squeeze(), window=14)
+                rsi_indicator = ta.momentum.RSIIndicator(close=close, window=14)
                 df['RSI'] = rsi_indicator.rsi()
-                print(rsi_indicator.rsi().shape)  # Should now be (1318,)
-                print(df['RSI'].shape)  # Confirms 1D structure
-
-                df['MACD'] = ta.trend.MACD(close=df['Close'].squeeze()).macd_diff()
-                df['BB_Width'] = ta.volatility.BollingerBands(close=df['Close'].squeeze()).bollinger_wband()
-                df['obv'] = ta.volume.OnBalanceVolumeIndicator(df['Close'].squeeze(), df['Volume'].squeeze()).on_balance_volume()
-                for lag in [1, 3, 5, 8, 13]:
-                    df[f'ret_lag_{lag}'] = df['returns'].shift(lag)
+                
+                # Add moving averages
+                df['sma_20'] = df['Close'].rolling(20).mean()
+                df['sma_50'] = df['Close'].rolling(50).mean()
+                
+                # Momentum features
+                df['momentum_5'] = df['Close'].pct_change(5)
+                df['momentum_10'] = df['Close'].pct_change(10)
+                
+                # Target generation
                 df['target'] = np.where(
                     df['returns'].shift(-3) > 0.015, 1,
                     np.where(df['returns'].shift(-3) < -0.015, -1, 0)
                 )
                 return df.dropna()
 
-            # Feature Engineering
             with st.spinner("Creating features..."):
-                df = create_features(data)
+                df = create_features(symbol_data.copy())
 
-            # Feature Scaling
-            scaler = StandardScaler()
+            # Initialize scaler and prepare features
             features = df.drop('target', axis=1)
-            X = scaler.fit_transform(features)
-            X = X.reshape((X.shape[0], 1, X.shape[1]))  # Reshape for LSTM
-
-            # Train/Test Split (Time-based)
-            split = int(len(df) * 0.8)
-            X_train, X_test = X[:split], X[split:]
-            y_train, y_test = df['target'].iloc[:split], df['target'].iloc[split:]
-
-            # Model File Path
+            n_features = features.shape[1]  # Get current feature count
+            
+            # Model path and scaler initialization
             model_path = os.path.join(MODEL_DIR, f"{ticker}_model.keras")
+            scaler = StandardScaler()
 
-            # Check if model already exists
             if os.path.exists(model_path):
-                with st.spinner(f"Loading saved model for {ticker}..."):
+                try:
+                    # Load existing model and check compatibility
                     model = load_model(model_path)
-                    st.success(f"Model loaded successfully!")
-            else:
-                # Model Architecture
-                def create_model():
-                    model = Sequential([
-                        LSTM(64, input_shape=(X_train.shape[1], X_train.shape[2]), return_sequences=True),
-                        Dropout(0.3),
-                        LSTM(32),
-                        Dropout(0.2),
-                        Dense(1, activation='tanh')  # Output between -1 and 1
-                    ])
-                    model.compile(optimizer=Adam(0.001), loss='mean_squared_error', metrics=['accuracy'])
-                    return model
+                    expected_features = model.layers[0].input_shape[2]
+                    
+                    if n_features != expected_features:
+                        st.warning(f"Feature mismatch: Model expects {expected_features} features, found {n_features}. Retraining...")
+                        os.remove(model_path)
+                        raise FileNotFoundError  # Force retrain
+                        
+                except Exception as e:
+                    # Handle model loading errors
+                    st.warning(f"Model loading failed: {str(e)}. Retraining...")
+                    os.remove(model_path)
+                    
+            if not os.path.exists(model_path):
+                # In the model architecture section
+                model = Sequential([
+                    Conv1D(32, 
+                        kernel_size=1,  # Must match input timesteps
+                        activation='relu',
+                        input_shape=(1, features.shape[1])),  # (1 timestep, N features)
+                    LSTM(64, return_sequences=True),
+                    Dropout(0.3),
+                    LSTM(32),
+                    Dense(1, activation='tanh')
+                ])
+                model.compile(optimizer=Adam(0.001), loss='mse')
 
-                with st.spinner(f"Training new model for {ticker}..."):
-                    model = create_model()
-                    early_stop = EarlyStopping(monitor='val_loss', patience=5)
-                    history = model.fit(
-                        X_train, y_train,
-                        epochs=50,
-                        batch_size=32,
-                        validation_split=0.2,
-                        callbacks=[early_stop],
-                        verbose=0
-                    )
-                    # Save the trained model
-                    model.save(model_path)
-                    st.success(f"Model saved successfully for {ticker}!")
+                
+                # Train/test split
+                split = int(len(df) * 0.8)
+                X_train = scaler.fit_transform(features.iloc[:split])
+                X_train = X_train.reshape((X_train.shape[0], 1, X_train.shape[1]))
+                
+                model.fit(X_train, df['target'].iloc[:split], 
+                        epochs=50, batch_size=32, verbose=0)
+                model.save(model_path)
+                
+                # Save scaler parameters
+                np.savez(os.path.join(MODEL_DIR, f"{ticker}_scaler.npz"),
+                        mean=scaler.mean_, scale=scaler.scale_)
 
-            # Generate Predictions
-            with st.spinner("Generating signals..."):
-                train_pred = model.predict(X_train).flatten()
-                test_pred = model.predict(X_test).flatten()
-                full_pred = np.concatenate([train_pred, test_pred])
+            # Transform data
+            X_full = scaler.transform(features)
+            X_full = X_full.reshape((X_full.shape[0], 1, X_full.shape[1]))
+            
+            # Generate predictions
+            predictions = model.predict(X_full).flatten()                   
+            
+            # Signal Generation Logic
+            df['lstm_signal'] = np.where(predictions > 0.7, 1, 
+                                        np.where(predictions < -0.7, -1, 0))
+            
+            # SMA Signals
+            df['sma_20'] = df['Close'].rolling(20).mean()
+            df['sma_50'] = df['Close'].rolling(50).mean()
+            df['sma_signal'] = np.where(df['sma_20'] > df['sma_50'], 1, -1)
+            
+            # Final Signal Combination
+            df['final_signal'] = np.where(
+                df['lstm_signal'] == df['sma_signal'],
+                df['lstm_signal'],
+                0
+            ).astype(int)
 
-            # Signal Generation with Dynamic Thresholds
-            upper_threshold = st.session_state.get('upper_threshold', 0.65)
-            lower_threshold = st.session_state.get('lower_threshold', 0.35)
+            # Align with original symbol_data index
+            aligned_signals = df.reindex(symbol_data.index).ffill()
+            
+            # Create VectorBT-compatible signals
+            entries = (aligned_signals['final_signal'] == 1) & (aligned_signals['final_signal'].shift(1) != 1)
+            exits = (aligned_signals['final_signal'] == -1) & (aligned_signals['final_signal'].shift(1) != -1)
+            
+            return entries, exits, aligned_signals['Close']
 
-            df['signal'] = np.where(full_pred > upper_threshold, 1,
-                                    np.where(full_pred < -lower_threshold, -1, 0))
-
-            # Align signals with original data
-            aligned_signals = df['signal'].reindex(data.index).ffill().dropna()
-            aligned_close = data['Close'].reindex(aligned_signals.index)
-
-            # Convert to boolean signals for VectorBT
-            entries = (aligned_signals == 1) & (aligned_signals.shift(1) != 1)
-            exits = (aligned_signals == -1) & (aligned_signals.shift(1) != -1)
-
-            return entries, exits, aligned_close
 
         entries, exits, aligned_close = calculate_signals(data, symbol)
 
@@ -410,14 +433,7 @@ if st.session_state.get("selected_symbol"):
             col2.metric("Final Value", f"${end_value:,.2f}")
             col3.metric("Return Percentage", f"{total_return * 100:.2f}%")
             col4.metric("CAGR", f"{strat_cagr * 100:.2f}%")
-            # col2.metric("Annualized Return", f"{portfolio.annualized_return()*100:.2f}%")
-
-            # col1, col2, col3 = st.columns(3)
-            # col1.metric("Total Return", f"{total_return * 100:.2f}%")
-            # col2.metric("Annualized Return", f"{portfolio.annualized_return()*100:.2f}%")
-            # col3.metric("Max Drawdown", f"{portfolio.max_drawdown()*100:.2f}%")
-
-
+    
             # ========== Trade Performance Summary ==========
             # Extract trade returns from the portfolio
             trade_returns = portfolio.trades.records_readable['Return']
